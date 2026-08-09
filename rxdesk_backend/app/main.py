@@ -1,32 +1,30 @@
 """
-RxDesk Backend - main.py (Part 1)
-===================================
-Today this file contains:
-  1. FastAPI app instance + CORS setup
-  2. SQL Server (pyodbc) connection handling, including automatic
-     discovery of MASSPRO's "active financial year" database.
-  3. A safe query runner that ALWAYS applies
-     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED
-     before touching the live ERP data (RxDesk's core safety rule).
-  4. Auth endpoints: /api/auth/login, /api/auth/me
-  5. Admin endpoints: /api/admin/create-user, /api/admin/users, /api/admin/erp-status
+RxDesk Backend - main.py
+===========================
+The FastAPI application entrypoint. This file wires everything
+together: CORS, startup tasks, and every router.
 
-Later phases will add app/routers/pharmacy.py, app/routers/mr.py, and
-app/routers/admin.py for the actual business endpoints (ledger, invoices,
-stock, near-expiry, etc.) and wire them in here with app.include_router().
+    app/database.py           -> SQL Server connection + safe query runner
+    app/auth.py                 -> SQLite logins, bcrypt, JWT
+    app/models.py                 -> ERP-data response schemas
+    app/routers/pharmacy.py       -> ledger, invoices, returns (PHARMACY role)
+    app/routers/mr.py             -> stock, near-expiry, sales, receivables (MR role)
+    app/routers/admin.py          -> user management, ERP status, dashboard (ADMIN role)
+
+main.py itself only keeps the two "who am I" auth endpoints
+(/api/auth/login, /api/auth/me), since those run before any role is
+even known yet - everything role-specific lives in its own router.
 """
 
-import os
 from datetime import timedelta
-from typing import Optional
 
-import pyodbc
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 
 from . import auth
+from .routers import admin, mr, pharmacy
 
 # Load variables from a .env file (if present) into os.environ
 load_dotenv()
@@ -59,155 +57,15 @@ def on_startup():
     print("RxDesk API started. SQLite auth DB is ready.")
 
 
-# ------------------------------------------------------------------
-# 2. SQL SERVER (ERP) CONNECTION CONFIG
-# ------------------------------------------------------------------
-# All of these should be set in your .env file, e.g.:
-#   MASSPRO_SQL_HOST=192.168.1.50
-#   MASSPRO_SQL_PORT=1433
-#   MASSPRO_SQL_USER=rxdesk_reader
-#   MASSPRO_SQL_PASSWORD=your_password_here
-#   MASSPRO_SQL_DRIVER={ODBC Driver 17 for SQL Server}
-#   MASSPRO_DB_PREFIX=MASSPRO_ST
-SQL_SERVER_HOST = os.getenv("MASSPRO_SQL_HOST", "localhost")
-SQL_SERVER_PORT = os.getenv("MASSPRO_SQL_PORT", "1433")
-SQL_SERVER_USER = os.getenv("MASSPRO_SQL_USER", "sa")
-SQL_SERVER_PASSWORD = os.getenv("MASSPRO_SQL_PASSWORD", "")
-SQL_SERVER_DRIVER = os.getenv("MASSPRO_SQL_DRIVER", "{ODBC Driver 17 for SQL Server}")
-
-# CONFIRMED: MASSPRO stores each Nepali fiscal year's transactional data
-# in its own database, named "ST" + a 4-digit Bikram Sambat (BS) year
-# code, e.g.:
-#   ST8081  -> fiscal year 2080-81 BS
-#   ST8182  -> fiscal year 2081-82 BS
-#   ST8283  -> fiscal year 2082-83 BS
-#   ST8384  -> fiscal year 2083-84 BS  (current, as of writing)
-# RxDesk asks SQL Server which ST######## databases exist and picks the
-# one with the highest 4-digit number, so it keeps working automatically
-# each Shrawan (Nepali new fiscal year) without any code change or
-# redeploy - your ERP admin just creates the new ST#### database as usual.
-#
-# NOTE: this simple "highest number wins" comparison will need a small
-# tweak whenever the BS calendar rolls from ...99 back to ...00 (i.e.
-# BS 2099 -> 2100), since e.g. 8099 > 8100 numerically even though 8100
-# is the later year. That rollover is roughly 15 years away, so it is
-# not handled yet - flag it to me closer to that date and I'll patch
-# extract_year_suffix() to handle the wraparound.
-MASSPRO_DB_PREFIX = os.getenv("MASSPRO_DB_PREFIX", "ST")
-
-# Cached so we don't re-run the discovery query on every single API call.
-_active_db_cache: Optional[str] = None
-
-
-def get_master_connection() -> pyodbc.Connection:
-    """Connects to SQL Server's built-in 'master' database only - used
-    purely to look up which yearly MASSPRO databases exist."""
-    conn_str = (
-        f"DRIVER={SQL_SERVER_DRIVER};"
-        f"SERVER={SQL_SERVER_HOST},{SQL_SERVER_PORT};"
-        f"DATABASE=master;"
-        f"UID={SQL_SERVER_USER};"
-        f"PWD={SQL_SERVER_PASSWORD};"
-        f"TrustServerCertificate=yes;"
-    )
-    return pyodbc.connect(conn_str, timeout=5)
-
-
-def discover_active_year_db(force_refresh: bool = False) -> str:
-    """
-    Queries sys.databases for names matching 'ST' + exactly 4 digits
-    (e.g. ST8384) and returns the one with the highest 4-digit BS year
-    code, i.e. the current Nepali fiscal year's database. Cached
-    in-memory after the first successful call.
-    """
-    global _active_db_cache
-    if _active_db_cache is not None and not force_refresh:
-        return _active_db_cache
-
-    conn = get_master_connection()
-    cursor = conn.cursor()
-    # SQL Server's LIKE supports character-range wildcards ([0-9]), which
-    # lets us match "ST" followed by EXACTLY 4 digits (e.g. ST8384) and
-    # nothing else. This deliberately excludes unrelated databases that
-    # might merely start with "ST" (e.g. a "STAGING" database) as well
-    # as malformed names, instead of a loose "ST%" match.
-    like_pattern = f"{MASSPRO_DB_PREFIX}[0-9][0-9][0-9][0-9]"
-    cursor.execute("SELECT name FROM sys.databases WHERE name LIKE ?", (like_pattern,))
-    rows = cursor.fetchall()
-    conn.close()
-
-    if not rows:
-        raise RuntimeError(
-            f"No ERP fiscal-year databases found matching pattern "
-            f"'{MASSPRO_DB_PREFIX}' + 4 digits (e.g. {MASSPRO_DB_PREFIX}8384). "
-            f"Check the MASSPRO_DB_PREFIX environment variable and confirm "
-            f"the SQL login has permission to list databases (VIEW ANY "
-            f"DEFINITION or sysadmin on the server)."
-        )
-
-    def extract_year_suffix(db_name: str) -> int:
-        """
-        Extracts the 4-digit BS year code as an integer, e.g. "ST8384" -> 8384.
-        Higher number = later fiscal year (see the wraparound note above
-        the MASSPRO_DB_PREFIX definition for the one long-term edge case).
-        """
-        suffix = db_name[len(MASSPRO_DB_PREFIX):]
-        return int(suffix) if suffix.isdigit() and len(suffix) == 4 else -1
-
-    db_names = [row[0] for row in rows]
-    db_names.sort(key=extract_year_suffix, reverse=True)
-
-    _active_db_cache = db_names[0]
-    return _active_db_cache
-
-
-def get_erp_connection() -> pyodbc.Connection:
-    """Opens a connection to whichever MASSPRO yearly database is currently active."""
-    active_db = discover_active_year_db()
-    conn_str = (
-        f"DRIVER={SQL_SERVER_DRIVER};"
-        f"SERVER={SQL_SERVER_HOST},{SQL_SERVER_PORT};"
-        f"DATABASE={active_db};"
-        f"UID={SQL_SERVER_USER};"
-        f"PWD={SQL_SERVER_PASSWORD};"
-        f"TrustServerCertificate=yes;"
-    )
-    return pyodbc.connect(conn_str, timeout=10)
+# Wire in every role-specific router. Each one already enforces its own
+# role restriction internally via `dependencies=[Depends(auth.require_role([...]))]`.
+app.include_router(pharmacy.router)
+app.include_router(mr.router)
+app.include_router(admin.router)
 
 
 # ------------------------------------------------------------------
-# 3. SAFE QUERY RUNNER
-# ------------------------------------------------------------------
-def run_query(sql: str, params: tuple = ()) -> list[dict]:
-    """
-    Runs a SELECT query against the live ERP database.
-
-    THIS IS THE ONLY FUNCTION THAT SHOULD EVER TALK TO THE ERP DATABASE.
-    Every future router (pharmacy.py, mr.py, admin.py) should call this
-    instead of opening its own pyodbc connection, so the safety rule
-    below is never accidentally skipped.
-
-    ALWAYS sets READ UNCOMMITTED isolation first, per RxDesk's Database
-    Safety Rule - this guarantees our reporting queries place ZERO locks
-    on tables the live ERP is actively writing sales into.
-
-    Returns a list of dicts, e.g. [{"Bill_No": 123, "Amount": 4500.0}, ...]
-    """
-    conn = get_erp_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;")
-        cursor.execute(sql, params)
-        columns = [column[0] for column in cursor.description]
-        results = [dict(zip(columns, row)) for row in cursor.fetchall()]
-        return results
-    finally:
-        cursor.close()
-        conn.close()
-
-
-# ------------------------------------------------------------------
-# 4. AUTH ENDPOINTS
+# 2. AUTH ENDPOINTS (apply to every role, before a role is even known)
 # ------------------------------------------------------------------
 @app.post("/api/auth/login", response_model=auth.Token, tags=["Auth"])
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
@@ -254,48 +112,7 @@ async def read_current_user(current_user: auth.UserInDB = Depends(auth.get_curre
 
 
 # ------------------------------------------------------------------
-# 5. ADMIN ENDPOINTS
-# ------------------------------------------------------------------
-@app.post("/api/admin/create-user", response_model=auth.UserOut, tags=["Admin"])
-async def create_user_endpoint(
-    new_user: auth.UserCreate,
-    current_admin: auth.UserInDB = Depends(auth.require_role(["ADMIN"])),
-):
-    """
-    ADMIN ONLY. Creates a new RxDesk login and maps it to an ERP identifier:
-      - role="PHARMACY" -> erp_code = General_Ledger.GlCode
-      - role="MR"        -> erp_code = Product_Company.Company_Code
-      - role="ADMIN"     -> erp_code not required
-    """
-    return auth.create_user(new_user)
-
-
-@app.get("/api/admin/users", response_model=list[auth.UserOut], tags=["Admin"])
-async def list_users_endpoint(
-    current_admin: auth.UserInDB = Depends(auth.require_role(["ADMIN"])),
-):
-    """ADMIN ONLY. Lists every RxDesk login for the user-management screen."""
-    return auth.list_all_users()
-
-
-@app.get("/api/admin/erp-status", tags=["Admin"])
-async def erp_status(current_admin: auth.UserInDB = Depends(auth.require_role(["ADMIN"]))):
-    """
-    ADMIN ONLY. Quick health check confirming RxDesk can reach SQL Server
-    and showing which yearly ERP database it's currently talking to.
-    """
-    try:
-        active_db = discover_active_year_db(force_refresh=True)
-        return {"status": "connected", "active_database": active_db}
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Could not reach ERP SQL Server: {str(e)}",
-        )
-
-
-# ------------------------------------------------------------------
-# 6. ROOT / HEALTH CHECK
+# 3. ROOT / HEALTH CHECK
 # ------------------------------------------------------------------
 @app.get("/", tags=["Health"])
 async def root():
